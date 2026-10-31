@@ -1999,6 +1999,7 @@ export default function App() {
 
   // Audio Refs
   const wsRef = useRef<WebSocket | null>(null);
+  const speechRecRef = useRef<any>(null);
   const inputAudioCtxRef = useRef<AudioContext | null>(null);
   const outputAudioCtxRef = useRef<AudioContext | null>(null);
   const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -2007,6 +2008,131 @@ export default function App() {
   const nextStartTimeRef = useRef<number>(0);
   const activeSourcesRef = useRef<AudioBufferSourceNode[]>([]);
   const hasOpenedAppInBackgroundRef = useRef<boolean>(false);
+
+  // Client-side voice interaction processor for static host deployments (Netlify/Vercel)
+  const processVoiceTurnClient = async (spokenText: string) => {
+    if (!spokenText.trim() || isAiSpeaking) return;
+    try {
+      setIsAiSpeaking(true);
+      setError(null);
+
+      const userMsg: Message = {
+        id: `msg_user_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        role: 'user',
+        content: spokenText.trim()
+      };
+      const updatedMessages = [...messages, userMsg];
+      updateActiveSessionMessages(updatedMessages);
+
+      const clientRes = await sendClientGeminiChat({
+        email: currentUser?.email || '',
+        personality,
+        messages: updatedMessages.map(m => ({
+          role: m.role === 'user' ? 'user' : 'assistant',
+          content: m.content
+        })),
+        apiKey: currentUser?.apiKey || localStorage.getItem('blackbell_custom_api_key') || ''
+      });
+
+      const parsed = parseAiResponse(clientRes.text);
+      const aiReplyText = parsed.mainText || clientRes.text;
+
+      const aiMsg: Message = {
+        id: `msg_ai_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+        role: 'ai',
+        content: clientRes.text,
+        winner: clientRes.winner,
+        latency: clientRes.latency
+      };
+      updateActiveSessionMessages([...updatedMessages, aiMsg]);
+
+      // Speak AI response with voice model preservation
+      await playMessageTTS(aiReplyText, updatedMessages.length);
+    } catch (err: any) {
+      console.warn("Client voice turn error:", err);
+      setIsAiSpeaking(false);
+    }
+  };
+
+  // Launch direct browser voice call when WebSocket backend is not present on CDN
+  const startClientVoiceCall = async () => {
+    try {
+      setError(null);
+      setNetworkStatus('stable');
+      setIsConnecting(false);
+      isConnectingRef.current = false;
+      setIsConnected(true);
+      setIsRecording(true);
+      isRecordingRef.current = true;
+      reconnectAttemptsRef.current = 0;
+
+      if (!outputAudioCtxRef.current || outputAudioCtxRef.current.state === 'closed') {
+        outputAudioCtxRef.current = new AudioContext({ sampleRate: 24000 });
+      }
+      if (outputAudioCtxRef.current.state === 'suspended') {
+        await outputAudioCtxRef.current.resume();
+      }
+
+      const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (SpeechRecognition) {
+        if (speechRecRef.current) {
+          try { speechRecRef.current.abort(); } catch(e) {}
+        }
+        const rec = new SpeechRecognition();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = 'hi-IN'; // Recognizes Hindi, Hinglish, and English naturally
+
+        let timer: any = null;
+        let lastSpoken = '';
+
+        rec.onresult = (event: any) => {
+          let interim = '';
+          for (let i = event.resultIndex; i < event.results.length; i++) {
+            const transcript = event.results[i][0].transcript;
+            if (event.results[i].isFinal) {
+              lastSpoken += ' ' + transcript;
+            } else {
+              interim += transcript;
+            }
+          }
+          const current = (lastSpoken + ' ' + interim).trim();
+          if (current) {
+            setVoiceTranscription(current);
+            if (timer) clearTimeout(timer);
+            timer = setTimeout(async () => {
+              if (current.trim()) {
+                const toSend = current.trim();
+                lastSpoken = '';
+                setVoiceTranscription('');
+                await processVoiceTurnClient(toSend);
+              }
+            }, 1200);
+          }
+        };
+
+        rec.onerror = (e: any) => {
+          console.warn("[Voice Rec] Event:", e.error);
+        };
+
+        rec.onend = () => {
+          if (isRecordingRef.current && mode === 'voice') {
+            try { rec.start(); } catch(e) {}
+          }
+        };
+
+        speechRecRef.current = rec;
+        try {
+          rec.start();
+        } catch (e) {}
+      } else {
+        showToast("Voice call active. Speak now or tap to interact.");
+      }
+    } catch (err: any) {
+      console.error("Client voice start failed:", err);
+      setError("Microphone permission required for voice calls.");
+    }
+  };
 
   // Existing Voice API Logic
   const handleUnintentionalDisconnect = () => {
@@ -2025,6 +2151,14 @@ export default function App() {
     // Perform quiet cleanup of previous connection handles to prevent leaks
     disconnect(true);
 
+    const isStaticDeploy = window.location.hostname.includes('netlify.app') || window.location.hostname.includes('vercel.app');
+    if (isStaticDeploy || reconnectAttemptsRef.current >= 1) {
+      console.log("[Voice] WebSocket unavailable on static CDN. Automatically transitioning to Client Live Voice Mode.");
+      reconnectAttemptsRef.current = 0;
+      startClientVoiceCall();
+      return;
+    }
+
     if (reconnectAttemptsRef.current < 5) {
       reconnectAttemptsRef.current += 1;
       setNetworkStatus('reconnecting');
@@ -2040,16 +2174,23 @@ export default function App() {
         connectToLiveAPI();
       }, delay);
     } else {
-      console.log("[Voice] Exceeded maximum reconnect attempts. Going offline.");
+      console.log("[Voice] Exceeded maximum reconnect attempts. Switching to Client Voice Mode.");
       reconnectAttemptsRef.current = 0;
-      setNetworkStatus('offline');
-      setError("Connection failed. Weak or slow internet connection. Tap button to retry.");
+      startClientVoiceCall();
     }
   };
 
   const connectToLiveAPI = async () => {
     if (isConnectingRef.current || (wsRef.current && wsRef.current.readyState === WebSocket.CONNECTING)) {
       console.log("Connection already pending. Ignoring duplicate request.");
+      return;
+    }
+
+    // On Netlify and Vercel static CDN hosting, directly launch Client Voice Call Mode
+    const isStaticDeploy = window.location.hostname.includes('netlify.app') || window.location.hostname.includes('vercel.app');
+    if (isStaticDeploy) {
+      console.log("[Voice] Netlify/Vercel deployment detected. Launching direct Client Voice Call Mode...");
+      await startClientVoiceCall();
       return;
     }
 
@@ -2658,6 +2799,10 @@ export default function App() {
     if (inputAudioCtxRef.current) {
        try { inputAudioCtxRef.current.close(); } catch(e) {}
        inputAudioCtxRef.current = null;
+    }
+    if (speechRecRef.current) {
+       try { speechRecRef.current.abort(); } catch(e) {}
+       speechRecRef.current = null;
     }
     if (outputAudioCtxRef.current) {
        try { outputAudioCtxRef.current.close(); } catch(e) {}
