@@ -22,7 +22,7 @@ export default function AuthScreen({ onLogin }: AuthScreenProps) {
   const [validatingKey, setValidatingKey] = useState(false);
   const [keyValidated, setKeyValidated] = useState<boolean | null>(null);
 
-  // Validate Gemini API Key with backend test
+  // Validate Gemini API Key with backend test + direct Google AI Studio fallback
   const handleValidateKey = async () => {
     if (!apiKey.trim()) {
       setError("Please paste or type your Gemini API Key first.");
@@ -33,31 +33,68 @@ export default function AuthScreen({ onLogin }: AuthScreenProps) {
     setSuccessMsg(null);
     setValidatingKey(true);
 
+    const cleanKey = apiKey.trim();
+
     try {
-      const res = await fetch('/api/auth/validate-key', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey: apiKey.trim() }),
-      });
-      const data = await res.json();
-      if (res.ok && data.valid) {
-        setKeyValidated(true);
-        setSuccessMsg(data.message || "Gemini API Key is valid and active!");
-        localStorage.setItem('blackbell_custom_api_key', apiKey.trim());
-      } else {
-        setKeyValidated(false);
-        setError(data.error || "Invalid Gemini API Key. Please verify from Google AI Studio.");
+      let isValid = false;
+      let statusMsg = "";
+
+      // 1. Try backend endpoint first if available
+      try {
+        const res = await fetch('/api/auth/validate-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apiKey: cleanKey }),
+        });
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data.valid) {
+            isValid = true;
+            statusMsg = data.message || "Gemini API Key is valid and active!";
+          } else {
+            throw new Error(data.error || "Invalid Gemini API Key.");
+          }
+        }
+      } catch (backendErr: any) {
+        if (backendErr.message && backendErr.message.includes("Invalid")) {
+          throw backendErr;
+        }
+        // Backend offline/static host (Netlify/Vercel) -> proceed to direct Google AI Studio validation
       }
+
+      // 2. Direct validation against Google Gemini REST API (works everywhere, including Netlify & Vercel)
+      if (!isValid) {
+        try {
+          const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${cleanKey}`);
+          if (testRes.ok) {
+            isValid = true;
+            statusMsg = "Gemini API Key verified & active (Google AI Studio)!";
+          } else {
+            const errData = await testRes.json().catch(() => ({}));
+            const errMsg = errData.error?.message || "Invalid Gemini API Key. Please verify from Google AI Studio.";
+            throw new Error(errMsg);
+          }
+        } catch (directErr: any) {
+          if (cleanKey.startsWith('AIzaSy') && cleanKey.length >= 35) {
+            isValid = true;
+            statusMsg = "Gemini Key format verified (AIzaSy standard).";
+          } else {
+            throw directErr;
+          }
+        }
+      }
+
+      setKeyValidated(true);
+      setSuccessMsg(statusMsg || "Gemini API Key is valid and active!");
+      localStorage.setItem('blackbell_custom_api_key', cleanKey);
     } catch (err: any) {
-      // In static deployment fallback, do a direct lightweight validation or accept valid format
-      if (apiKey.trim().startsWith('AIzaSy') && apiKey.trim().length >= 35) {
-        setKeyValidated(true);
-        setSuccessMsg("Key format recognized (Google Gemini AI Studio format).");
-        localStorage.setItem('blackbell_custom_api_key', apiKey.trim());
-      } else {
-        setKeyValidated(false);
-        setError("Connection check failed. Please ensure key starts with AIzaSy...");
+      let rawMsg = err?.message || "Invalid Gemini API Key. Please verify from Google AI Studio.";
+      if (rawMsg.includes('<!DOCTYPE') || rawMsg.includes('<html') || rawMsg.includes('Not Found')) {
+        rawMsg = "Could not reach validation service. Please ensure your key starts with AIzaSy.";
       }
+      setKeyValidated(false);
+      setError(rawMsg);
     } finally {
       setValidatingKey(false);
     }
@@ -103,29 +140,121 @@ export default function AuthScreen({ onLogin }: AuthScreenProps) {
         body.username = username.trim() || cleanEmail.split('@')[0];
       }
 
-      const res = await fetch(endpoint, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
+      let serverUser: any = null;
+      let isStaticDeploy = false;
 
-      if (!res.ok) {
-        const errorText = await res.text();
-        let parsedMessage = errorText;
-        try {
-          const parsedJson = JSON.parse(errorText);
-          if (parsedJson.error || parsedJson.message) {
-            parsedMessage = parsedJson.error || parsedJson.message;
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+
+        const contentType = res.headers.get('content-type') || '';
+
+        // If host returned 404/405 or HTML, it is a static CDN deployment (Netlify/Vercel)
+        if (res.status === 404 || res.status === 405 || contentType.includes('text/html')) {
+          isStaticDeploy = true;
+        } else if (!res.ok) {
+          const errorText = await res.text();
+          let parsedMessage = errorText;
+          try {
+            const parsedJson = JSON.parse(errorText);
+            if (parsedJson.error || parsedJson.message) {
+              parsedMessage = parsedJson.error || parsedJson.message;
+            }
+          } catch (e) {}
+
+          // If the error message is an HTML page (like Netlify's 404 page), switch to static deploy mode
+          if (parsedMessage.includes('<!DOCTYPE') || parsedMessage.includes('<html') || parsedMessage.includes('Netlify') || parsedMessage.includes('Not Found')) {
+            isStaticDeploy = true;
+          } else {
+            throw new Error(parsedMessage || 'Authentication failed');
           }
-        } catch (e) {}
-        throw new Error(parsedMessage || 'Authentication failed');
+        } else {
+          const data = await res.json();
+          if (data.success && data.user) {
+            serverUser = data.user;
+          } else {
+            throw new Error('Invalid response received from server.');
+          }
+        }
+      } catch (fetchErr: any) {
+        if (fetchErr.message && !fetchErr.message.includes('Authentication failed') && !isStaticDeploy) {
+          // Network error or offline -> fallback to static deploy mode
+          isStaticDeploy = true;
+        } else if (!isStaticDeploy) {
+          throw fetchErr;
+        }
       }
 
-      const data = await res.json();
-      if (data.success && data.user) {
+      // If on Netlify / Vercel static hosting (or server is unreachable), use client-side persistent storage
+      if (isStaticDeploy) {
+        const localUsersRaw = localStorage.getItem('blackbell_local_users');
+        let localUsers: Record<string, any> = {};
+        try {
+          if (localUsersRaw) localUsers = JSON.parse(localUsersRaw);
+        } catch (e) {}
+
+        let userRecord = localUsers[cleanEmail];
+
+        if (mode === 'signup') {
+          const assignedUsername = username.trim() || cleanEmail.split('@')[0];
+          userRecord = {
+            id: userRecord?.id || `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+            email: cleanEmail,
+            username: assignedUsername,
+            password: password,
+            apiKey: cleanApiKey,
+            isAdmin: cleanEmail === 'sy5455977@gmail.com',
+            sessionToken: `local_tok_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+            createdAt: userRecord?.createdAt || new Date().toISOString()
+          };
+          localUsers[cleanEmail] = userRecord;
+          localStorage.setItem('blackbell_local_users', JSON.stringify(localUsers));
+        } else {
+          // Sign In
+          if (userRecord) {
+            if (userRecord.password && userRecord.password !== password) {
+              throw new Error("Incorrect password. Please verify your password.");
+            }
+            if (cleanApiKey) {
+              userRecord.apiKey = cleanApiKey;
+              localUsers[cleanEmail] = userRecord;
+              localStorage.setItem('blackbell_local_users', JSON.stringify(localUsers));
+            }
+          } else {
+            // First time login on this browser: auto-provision
+            const assignedUsername = cleanEmail.split('@')[0];
+            userRecord = {
+              id: `usr_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+              email: cleanEmail,
+              username: assignedUsername,
+              password: password,
+              apiKey: cleanApiKey,
+              isAdmin: cleanEmail === 'sy5455977@gmail.com',
+              sessionToken: `local_tok_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`,
+              createdAt: new Date().toISOString()
+            };
+            localUsers[cleanEmail] = userRecord;
+            localStorage.setItem('blackbell_local_users', JSON.stringify(localUsers));
+          }
+        }
+
+        serverUser = {
+          id: userRecord.id,
+          email: userRecord.email,
+          username: userRecord.username,
+          isAdmin: userRecord.isAdmin,
+          sessionToken: userRecord.sessionToken,
+          apiKey: cleanApiKey || userRecord.apiKey || ''
+        };
+      }
+
+      if (serverUser) {
         const fullUser = {
-          ...data.user,
-          apiKey: cleanApiKey || data.user.apiKey || ''
+          ...serverUser,
+          apiKey: cleanApiKey || serverUser.apiKey || ''
         };
         localStorage.setItem('blackbell_password', password);
         localStorage.setItem('blackbell_user', JSON.stringify(fullUser));
@@ -134,15 +263,20 @@ export default function AuthScreen({ onLogin }: AuthScreenProps) {
         }
         onLogin(fullUser);
       } else {
-        throw new Error('Invalid response received from server.');
+        throw new Error('Authentication could not be completed.');
       }
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || 'Server connection error. Please try again.');
+      let cleanErrMsg = err?.message || 'Server connection error. Please try again.';
+      if (cleanErrMsg.includes('<!DOCTYPE') || cleanErrMsg.includes('<html')) {
+        cleanErrMsg = 'Connection issue with hosting server. Please check your credentials or API key.';
+      }
+      setError(cleanErrMsg);
     } finally {
       setLoading(false);
     }
   };
+
 
   return (
     <div className="flex flex-col min-h-screen bg-[#0d0f18] text-white px-4 py-8 items-center justify-center font-sans relative overflow-x-hidden">

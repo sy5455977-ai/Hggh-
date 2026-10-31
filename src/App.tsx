@@ -8,6 +8,7 @@ import { BuilderProgressIndicator } from './components/BuilderProgressIndicator'
 import { SearchKnowledgeModal } from './components/SearchKnowledgeModal';
 import { BellVideoScreen } from './components/BellVideoScreen';
 import { AdminVideoSettings } from './components/AdminVideoSettings';
+import { sendClientGeminiChat } from './utils/clientAi';
 
 type Message = { 
   id?: string;
@@ -496,30 +497,63 @@ export default function App() {
   const [apiKeyModalMsg, setApiKeyModalMsg] = useState<{ text: string; isError: boolean } | null>(null);
 
   const handleValidateKeyInModal = async () => {
-    if (!apiKeyInputValue.trim()) {
+    const cleanKey = apiKeyInputValue.trim();
+    if (!cleanKey) {
       setApiKeyModalMsg({ text: "Please enter or paste an API Key first.", isError: true });
       return;
     }
     setApiKeyValidating(true);
     setApiKeyModalMsg(null);
     try {
-      const res = await fetch('/api/auth/validate-key', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ apiKey: apiKeyInputValue.trim() })
-      });
-      const data = await res.json();
-      if (res.ok && data.valid) {
-        setApiKeyModalMsg({ text: data.message || "Gemini API Key is valid and active!", isError: false });
-      } else {
-        setApiKeyModalMsg({ text: data.error || "Invalid Gemini API Key.", isError: true });
+      let isValidated = false;
+      let msg = "";
+
+      // 1. Try backend check first
+      try {
+        const res = await fetch('/api/auth/validate-key', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ apiKey: cleanKey })
+        });
+        const contentType = res.headers.get('content-type') || '';
+        if (res.ok && contentType.includes('application/json')) {
+          const data = await res.json();
+          if (data.valid) {
+            isValidated = true;
+            msg = data.message || "Gemini API Key is valid and active!";
+          }
+        }
+      } catch (be) {}
+
+      // 2. Direct validation against Google AI Studio endpoint
+      if (!isValidated) {
+        try {
+          const testRes = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${cleanKey}`);
+          if (testRes.ok) {
+            isValidated = true;
+            msg = "Gemini API Key verified & active (Google AI Studio)!";
+          } else {
+            const errData = await testRes.json().catch(() => ({}));
+            const errMsg = errData.error?.message || "Invalid Gemini API Key. Please verify from Google AI Studio.";
+            throw new Error(errMsg);
+          }
+        } catch (directErr: any) {
+          if (cleanKey.startsWith('AIzaSy') && cleanKey.length >= 35) {
+            isValidated = true;
+            msg = "Key format recognized (Google Gemini AI Studio format).";
+          } else {
+            throw directErr;
+          }
+        }
       }
-    } catch (e) {
-      if (apiKeyInputValue.trim().startsWith('AIzaSy') && apiKeyInputValue.trim().length >= 35) {
-        setApiKeyModalMsg({ text: "Key format recognized (Google Gemini AI Studio format).", isError: false });
-      } else {
-        setApiKeyModalMsg({ text: "Connection error during validation check.", isError: true });
+
+      setApiKeyModalMsg({ text: msg || "Gemini API Key is valid and active!", isError: false });
+    } catch (e: any) {
+      let errorText = e?.message || "Connection error during validation check.";
+      if (errorText.includes('<!DOCTYPE') || errorText.includes('<html')) {
+        errorText = "Invalid API Key or network issue. Please verify from Google AI Studio.";
       }
+      setApiKeyModalMsg({ text: errorText, isError: true });
     } finally {
       setApiKeyValidating(false);
     }
@@ -1878,13 +1912,53 @@ export default function App() {
           throw new Error("Session expired. Please login again.");
         }
       }
-      if (!res.ok) {
-        throw new Error(await res.text());
+      let aiText = "";
+      let winner = "";
+      let latency = "";
+      let isResponseImage = false;
+      let isStaticHost = false;
+
+      const contentType = res.headers.get('content-type') || '';
+      if (res.status === 404 || res.status === 405 || contentType.includes('text/html')) {
+        isStaticHost = true;
+      } else if (!res.ok) {
+        const errorText = await res.text();
+        if (errorText.includes('<!DOCTYPE') || errorText.includes('<html') || errorText.includes('Netlify') || errorText.includes('Not Found')) {
+          isStaticHost = true;
+        } else {
+          throw new Error(errorText);
+        }
+      } else {
+        winner = res.headers.get('x-model-winner') || '';
+        latency = res.headers.get('x-model-latency') || '';
+        isResponseImage = res.headers.get('x-is-image') === 'true';
+        aiText = await res.text();
       }
-      const winner = res.headers.get('x-model-winner') || '';
-      const latency = res.headers.get('x-model-latency') || '';
-      const isResponseImage = res.headers.get('x-is-image') === 'true';
-      const aiText = await res.text();
+
+      // If on Netlify / Vercel static hosting, generate directly via user's Gemini key
+      if (isStaticHost) {
+        const clientRes = await sendClientGeminiChat({
+          email: currentUser?.email || '',
+          personality,
+          messages: newMessages.map(m => ({
+            role: m.role === 'user' ? 'user' : 'assistant',
+            content: m.content,
+            isImage: m.isImage,
+            attachment: m.isAttachment ? {
+              base64: m.imageBytes,
+              mimeType: m.mimeType,
+              name: m.fileName
+            } : undefined,
+            attachments: (m as any).attachments
+          })),
+          apiKey: currentUser?.apiKey || localStorage.getItem('blackbell_custom_api_key') || ''
+        });
+        aiText = clientRes.text;
+        isResponseImage = !!clientRes.isImage;
+        winner = clientRes.winner;
+        latency = clientRes.latency;
+      }
+
       const finalMsg: Message = { 
         id: `msg_ai_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
         role: 'ai', 
@@ -1906,7 +1980,10 @@ export default function App() {
         console.log("Fetch aborted by user.");
         return;
       }
-      const errorMsg = e?.message || "Error connecting to AI Server.";
+      let errorMsg = e?.message || "Error connecting to AI Server.";
+      if (errorMsg.includes('<!DOCTYPE') || errorMsg.includes('<html')) {
+        errorMsg = "Hosting server is offline. Please enter a valid Gemini API Key to chat directly.";
+      }
       updateActiveSessionMessages([...newMessages, { role: 'ai', content: `Error: ${errorMsg}. Please try again.` }]);
     } finally {
       setIsTyping(false);
